@@ -29,11 +29,44 @@ typename pcl::PointCloud<PointT>::Ptr ProcessPointClouds<PointT>::FilterCloud(ty
 
     // TODO:: Fill in the function to do voxel grid point reduction and region based filtering
 
+    typename pcl::PointCloud<PointT>::Ptr filtercloud(new pcl::PointCloud<PointT>);
+    pcl::VoxelGrid<PointT> vox;
+    vox.setInputCloud(cloud);
+    vox.setLeafSize(filterRes, filterRes, filterRes);
+    vox.filter(*filtercloud);
+
+    typename pcl::PointCloud<PointT>::Ptr cropfiltercloud(new pcl::PointCloud<PointT>);
+    pcl::CropBox<PointT> region(true);
+    region.setMin(minPoint);
+    region.setMax(maxPoint);
+    region.setInputCloud(filtercloud);
+    region.filter(*cropfiltercloud);
+
+    typename pcl::PointCloud<PointT>::Ptr roofindices(new pcl::PointCloud<PointT>);
+    std::vector<int> indices;
+    pcl::CropBox<PointT> roof(true);
+    region.setMin(Eigen::Vector4f(-3,-3,-3,1));
+    region.setMax(Eigen::Vector4f(3,3,3,1));
+    region.setInputCloud(cropfiltercloud);
+    region.filter(indices);
+
+    typename pcl::PointCloud<PointT>::Ptr cropfinalcloud(new pcl::PointCloud<PointT>);
+    pcl::PointIndices::Ptr roofinliers(new pcl::PointIndices);
+    for (int index : indices){
+        roofinliers->indices.push_back(index);
+    }
+    pcl::ExtractIndices<PointT> extract;
+    extract.setInputCloud(cropfiltercloud);
+    extract.setIndices(roofinliers);
+    extract.setNegative(true);
+    extract.filter(*cropfinalcloud);
+
+
     auto endTime = std::chrono::steady_clock::now();
     auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
     std::cout << "filtering took " << elapsedTime.count() << " milliseconds" << std::endl;
 
-    return cloud;
+    return cropfinalcloud;
 
 }
 
@@ -85,6 +118,31 @@ std::pair<typename pcl::PointCloud<PointT>::Ptr, typename pcl::PointCloud<PointT
     return segResult;
 }
 
+template<typename PointT>
+std::pair<typename pcl::PointCloud<PointT>::Ptr, typename pcl::PointCloud<PointT>::Ptr> ProcessPointClouds<PointT>::SegmentPlaneCityBlock(typename pcl::PointCloud<PointT>::Ptr cloud, int maxIterations, float distanceThreshold)
+{
+    // Time segmentation process
+    auto startTime = std::chrono::steady_clock::now();
+    // TODO:: Fill in this function to find inliers for the cloud.
+    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+    pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
+    pcl::SACSegmentation<PointT> seg;
+    seg.setOptimizeCoefficients(true);
+    seg.setModelType(pcl::SACMODEL_PLANE);
+    seg.setMethodType(pcl::SAC_RANSAC);
+    seg.setMaxIterations(maxIterations);
+    seg.setDistanceThreshold(distanceThreshold);
+    seg.setInputCloud(cloud);
+    seg.segment(*inliers,*coefficients);
+
+    auto endTime = std::chrono::steady_clock::now();
+    auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+    std::cout << "plane segmentation took " << elapsedTime.count() << " milliseconds" << std::endl;
+
+    std::pair<typename pcl::PointCloud<PointT>::Ptr, typename pcl::PointCloud<PointT>::Ptr> segResult = SeparateClouds(inliers,cloud);
+    return segResult;
+}
+
 
 template<typename PointT>
 std::vector<typename pcl::PointCloud<PointT>::Ptr> ProcessPointClouds<PointT>::Clustering(typename pcl::PointCloud<PointT>::Ptr cloud, float clusterTolerance, int minSize, int maxSize)
@@ -124,6 +182,7 @@ std::vector<typename pcl::PointCloud<PointT>::Ptr> ProcessPointClouds<PointT>::C
 }
 
 
+
 template<typename PointT>
 Box ProcessPointClouds<PointT>::BoundingBox(typename pcl::PointCloud<PointT>::Ptr cluster)
 {
@@ -139,6 +198,43 @@ Box ProcessPointClouds<PointT>::BoundingBox(typename pcl::PointCloud<PointT>::Pt
     box.x_max = maxPoint.x;
     box.y_max = maxPoint.y;
     box.z_max = maxPoint.z;
+
+    return box;
+}
+
+template<typename PointT>
+BoxQ ProcessPointClouds<PointT>::QBoundingBox(typename pcl::PointCloud<PointT>::Ptr cluster)
+{
+
+    // Find efficient bounding box for one of the clusters
+    typename pcl::PointCloud<PointT>::Ptr cloudPCAprojection (new pcl::PointCloud<PointT>);
+    /*
+    pcl::PCA<PointT> pca;
+    pca.setInputCloud(cluster);
+    pca.project(*cluster, *cloudPCAprojection);
+    */
+    // Compute principal directions
+    Eigen::Vector4f pcaCentroid;
+    pcl::compute3DCentroid(*cluster, pcaCentroid);
+    Eigen::Matrix3f covariance;
+    computeCovarianceMatrixNormalized(*cluster, pcaCentroid, covariance);
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eigen_solver(covariance, Eigen::ComputeEigenvectors);
+    Eigen::Matrix3f eigenVectorsPCA = eigen_solver.eigenvectors();
+    eigenVectorsPCA.col(2) = eigenVectorsPCA.col(0).cross(eigenVectorsPCA.col(1));  /// This line is necessary for proper orientation in some cases. The numbers come out the same without it, but
+    
+    Eigen::Matrix4f projectionTransform(Eigen::Matrix4f::Identity());
+    projectionTransform.block<3,3>(0,0) = eigenVectorsPCA.transpose();
+    projectionTransform.block<3,1>(0,3) = -1.f * (projectionTransform.block<3,3>(0,0) * pcaCentroid.head<3>());
+    typename pcl::PointCloud<PointT>::Ptr cloudPointsProjected (new pcl::PointCloud<PointT>);
+    pcl::transformPointCloud(*cluster, *cloudPointsProjected, projectionTransform);
+    // Get the minimum and maximum points of the transformed cloud.
+    PointT minPoint, maxPoint;
+    pcl::getMinMax3D(*cloudPointsProjected, minPoint, maxPoint);
+    const Eigen::Vector3f meanDiagonal = 0.5f*(maxPoint.getVector3fMap() + minPoint.getVector3fMap());
+    
+    BoxQ box;
+    box.bboxQuaternion = eigenVectorsPCA; //Quaternions are a way to do rotations https://www.youtube.com/watch?v=mHVwd8gYLnI
+    box.bboxTransform = eigenVectorsPCA * meanDiagonal + pcaCentroid.head<3>();
 
     return box;
 }
